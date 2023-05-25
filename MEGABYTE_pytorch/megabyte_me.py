@@ -2,6 +2,7 @@ from collections import namedtuple
 
 import torch
 from torch import nn
+import torch.nn.functional as F
 import einops
 from einops import rearrange
 from einops.layers.torch import Rearrange
@@ -109,7 +110,6 @@ class Transformer(nn.Module):
             x = attn(x)
             x = ff(x) + x
 
-        print(x.shape)
         return self.norm(x)
 
 
@@ -147,7 +147,6 @@ class Megabyte(nn.Module):
         )
 
         self.l_embedder = nn.Embedding(V, D_L)
-        self.l_pos_embedder = nn.Embedding(config.P, D_L)
         self.l_transformer = Transformer(
             dim=config.D_L,
             layers=config.l_nlayers,
@@ -160,9 +159,12 @@ class Megabyte(nn.Module):
 
         # embedding = tokens embedding + absolute position embedding
         tokens_embed = embedder(rearrange(ids, "... s u -> ... (s u)", s=s, u=u))
-        pos = torch.cat([torch.arange(s*u) for _ in range(b)]).reshape(b, s*u)
-        pos_embed = pos_embedder(pos)
-        h = tokens_embed + pos_embed
+        if pos_embedder is not None:
+            pos = torch.cat([torch.arange(s*u) for _ in range(b)]).reshape(b, s*u)
+            pos_embed = pos_embedder(pos)
+            h = tokens_embed + pos_embed
+        else:
+            h = tokens_embed
 
         # add spatial tokens
         d = h.shape[-1]
@@ -179,22 +181,23 @@ class Megabyte(nn.Module):
         B, T = ids.shape
         P = self.config.P
         K = T//P
-        D_G = self.config.D_G
 
         global_in = self.patch_embed(
             ids=rearrange(ids, "... (K P) -> ... K P", K=K, P=P),
             embedder=self.g_embedder, pos_embedder=self.g_pos_embedder
         )
-        print(global_in.shape)
         global_out = self.g_transformer(global_in)
 
         local_in = self.gl_linear(global_out) + self.patch_embed(
             ids=rearrange(ids, "B (K P) -> (B K) P 1", B=B, K=K, P=P),
-            embedder=self.l_embedder, pos_embedder=self.l_pos_embedder
+            embedder=self.l_embedder, pos_embedder=None
         )
         local_out = self.l_transformer(local_in)
 
-        return local_out
+        lm_logits = F.linear(local_out, self.l_embedder.weight)
+        lm_logits = rearrange(lm_logits, "(B K) ... -> B K ...", B=B, K=K)
+
+        return lm_logits
 
 
 V = 256
@@ -203,6 +206,7 @@ D_G = 512
 D_L = 128
 T = 1024
 B = 2
+K = T//P
 
 config = MegabyteConfig(
     V=V,
@@ -210,7 +214,7 @@ config = MegabyteConfig(
     D_G=D_G,
     D_L=D_L,
     T_MAX=T,
-    pad_token_id=0,
+    pad_token_id=-100,
     g_nlayers=4,
     g_nheads=16,
     l_nlayers=2,
@@ -219,6 +223,11 @@ config = MegabyteConfig(
 
 megabyte = Megabyte(config)
 input_ids = torch.randint(0, 255, (B, T))
-x = megabyte(input_ids)
+lm_logits = megabyte(input_ids)
+loss = F.cross_entropy(
+    rearrange(lm_logits, "B K P V -> (B K) V P", B=B, K=K, P=P, V=V),
+    rearrange(input_ids, "... (K P) -> (... K) P", K=K, P=P),
+)
+loss.backward()
 
-print(x.shape, x.norm())
+print(lm_logits.shape, loss.norm())
