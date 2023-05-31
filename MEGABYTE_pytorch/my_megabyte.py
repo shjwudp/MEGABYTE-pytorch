@@ -11,9 +11,10 @@ from MEGABYTE_pytorch.attend import Attend
 MegabyteConfig = namedtuple(
     "MegabyteConfig",
     [
-        "V", "P", "D_G", "D_L", "T_MAX", "pad_token_id",
+        "V", "P", "D_G", "D_L", "T_MAX", "pad_id",
         "g_nheads", "g_nlayers",
         "l_nheads", "l_nlayers",
+        "initializer_range",
     ]
 )
 
@@ -129,8 +130,10 @@ class Megabyte(nn.Module):
     ):
         super().__init__()
         self.config = config
+        P = config.P
         V = config.V
         D_G = config.D_G
+        D_L = config.D_L
 
         self.g_embedder = nn.Embedding(V, D_G)
         self.g_pos_embedder = nn.Embedding(config.T_MAX, D_G)
@@ -154,6 +157,22 @@ class Megabyte(nn.Module):
             heads=config.l_nheads,
         )
 
+        self._init_weights()
+
+    def _init_weights(self):
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
+                if module.bias is not None:
+                    module.bias.data.zero_()
+            elif isinstance(module, nn.Embedding):
+                module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
+                if module.padding_idx is not None:
+                    module.weight.data[module.padding_idx].zero_()
+            elif isinstance(module, nn.LayerNorm):
+                module.bias.data.zero_()
+                module.weight.data.fill_(1.0)
+
     def patch_embed(self, *, ids, embedder, pos_embedder):
         b, s, u = ids.shape
 
@@ -169,7 +188,7 @@ class Megabyte(nn.Module):
         # add spatial tokens
         d = h.shape[-1]
         h = rearrange(h, "... (s u) d -> ... s (u d)", s=s, u=u, d=d)
-        embed_pad = torch.ones((b, 1, u*d), dtype=torch.long) * self.config.pad_token_id
+        embed_pad = torch.ones((b, 1, u*d), dtype=torch.long) * self.config.pad_id
         h, _ = einops.pack([h, embed_pad], "b * d")
 
         return h[:, :s, :]
@@ -200,34 +219,38 @@ class Megabyte(nn.Module):
         return lm_logits
 
 
-V = 256
-P = 4
-D_G = 512
-D_L = 128
-T = 1024
-B = 2
-K = T//P
+if __name__ == "__main__":
+    # forward-backward
+    V = 256
+    P = 4
+    D_G = 512
+    D_L = 128
+    T = 1024
+    B = 2
+    K = T//P
 
-config = MegabyteConfig(
-    V=V,
-    P=P,
-    D_G=D_G,
-    D_L=D_L,
-    T_MAX=T,
-    pad_token_id=-100,
-    g_nlayers=4,
-    g_nheads=16,
-    l_nlayers=2,
-    l_nheads=8,
-)
+    config = MegabyteConfig(
+        V=V,
+        P=P,
+        D_G=D_G,
+        D_L=D_L,
+        T_MAX=T,
+        pad_id=-100,
+        initializer_range=0.02,
+        g_nlayers=4,
+        g_nheads=16,
+        l_nlayers=2,
+        l_nheads=8,
+    )
 
-megabyte = Megabyte(config)
-input_ids = torch.randint(0, 255, (B, T))
-lm_logits = megabyte(input_ids)
-loss = F.cross_entropy(
-    rearrange(lm_logits, "B K P V -> (B K) V P", B=B, K=K, P=P, V=V),
-    rearrange(input_ids, "... (K P) -> (... K) P", K=K, P=P),
-)
-loss.backward()
+    megabyte = Megabyte(config)
+    input_ids = torch.randint(0, 255, (B, T))
+    lm_logits = megabyte(input_ids)
+    loss = F.cross_entropy(
+        rearrange(lm_logits, "B K P V -> (B K) V P", B=B, K=K, P=P, V=V),
+        rearrange(input_ids, "... (K P) -> (... K) P", K=K, P=P),
+    )
+    print(loss.shape)
+    loss.backward()
 
-print(lm_logits.shape, loss.norm())
+    print(lm_logits.shape, loss.norm())
